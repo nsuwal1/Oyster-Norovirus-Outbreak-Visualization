@@ -1,0 +1,866 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+Improved LightGBM Classifier with PSO:
+- Particle Swarm Optimization (PSO)
+- Categorical feature support
+- Enhanced data validation (duplicates, target leakage)
+- Early stopping with best_iteration
+- Threshold optimization
+- Class weighting
+- SHAP explanations with saved values
+- Feature importance (gain + split)
+- Model persistence (save/load)
+- PSO optimization history tracking
+- Comprehensive metrics and outputs
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (
+    accuracy_score, classification_report, roc_auc_score, 
+    precision_score, recall_score, f1_score, confusion_matrix, roc_curve,
+    matthews_corrcoef
+)
+from sklearn.utils.class_weight import compute_class_weight
+import pyswarms as ps
+import joblib
+import logging
+import matplotlib.pyplot as plt
+import shap
+from datetime import datetime
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+# Setup directories
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+for d in ["logs", "models", "predictions", "shap_outputs", "feature_importance", "pso_results"]:
+    os.makedirs(os.path.join(SCRIPT_DIR, d), exist_ok=True)
+
+# Configure logging
+log_filename = os.path.join(SCRIPT_DIR, 'logs', f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger()
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logger.addHandler(console)
+
+
+class LightGBMOptimizer:
+    def __init__(self, random_state=42, n_jobs=-1):
+        self.random_state = random_state
+        self.n_jobs = n_jobs
+        self.best_model = None
+        self.best_params = None
+        self.best_threshold = 0.5
+        self.feature_names = None
+        self.categorical_features = None
+        self.feature_dtypes = None
+        self.pso_history = []
+        
+    def load_data(self, file_path, target_col=None, id_col=None, date_col=None, 
+                  categorical_cols=None, sheet_name=0):
+        """Load and validate data with enhanced checks"""
+        logger.info(f"Loading data from {file_path}")
+        
+        if file_path.endswith('.xlsx') or file_path.endswith('.xls'):
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+        else:
+            df = pd.read_csv(file_path)
+        
+        logger.info(f"Loaded {len(df)} rows, {len(df.columns)} columns")
+        
+        # Check for duplicates
+        if target_col and id_col and id_col in df.columns:
+            dups = df[id_col].duplicated().sum()
+            if dups > 0:
+                logger.warning(f"Found {dups} duplicate IDs")
+        
+        # For prediction data (no target column)
+        if target_col is None:
+            return df, None, df.get(id_col), df.get(date_col)
+            
+        # For training data
+        required = [target_col]
+        exclude_cols = [target_col]
+        
+        if id_col and id_col in df.columns:
+            exclude_cols.append(id_col)
+        if date_col and date_col in df.columns:
+            exclude_cols.append(date_col)
+        
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing columns: {missing}")
+        
+        # Check for missing values
+        missing_counts = df.isnull().sum()
+        if missing_counts.any():
+            logger.warning(f"Missing values found:\n{missing_counts[missing_counts > 0]}")
+            raise ValueError("Dataset contains missing values. Please handle them first.")
+            
+        # Store feature names
+        self.feature_names = [col for col in df.columns if col not in exclude_cols]
+        
+        # Handle categorical features
+        if categorical_cols:
+            self.categorical_features = [c for c in categorical_cols if c in self.feature_names]
+            logger.info(f"Categorical features: {self.categorical_features}")
+        else:
+            # Auto-detect categorical features
+            self.categorical_features = []
+            for col in self.feature_names:
+                if df[col].dtype == 'object' or df[col].dtype.name == 'category':
+                    self.categorical_features.append(col)
+            if self.categorical_features:
+                logger.info(f"Auto-detected categorical features: {self.categorical_features}")
+        
+        # Convert categorical to category dtype
+        for col in self.categorical_features:
+            df[col] = df[col].astype('category')
+        
+        # Store feature dtypes
+        self.feature_dtypes = df[self.feature_names].dtypes.to_dict()
+        
+        # Split data
+        X = df[self.feature_names].copy()
+        y = df[target_col].copy()
+        
+        # Validate target
+        if not set(y.unique()).issubset({0, 1}):
+            raise ValueError(f"Target must be binary (0/1). Found: {y.unique()}")
+        
+        # Check for target leakage
+        for col in self.feature_names:
+            if df[col].dtype in ['int64', 'float64']:
+                corr = abs(df[col].corr(y))
+                if corr > 0.99:
+                    logger.warning(f"⚠️ Potential target leakage: {col} has correlation {corr:.4f} with target")
+        
+        logger.info(f"Features: {len(self.feature_names)}")
+        logger.info(f"Target distribution: {y.value_counts().to_dict()}")
+        
+        return X, y, df.get(id_col), df.get(date_col)
+    
+    def _validate_features(self, X, is_training=True):
+        """Validate feature consistency"""
+        if is_training:
+            return X
+        
+        missing = set(self.feature_names) - set(X.columns)
+        if missing:
+            raise ValueError(f"Missing features in prediction data: {missing}")
+        
+        extra = set(X.columns) - set(self.feature_names)
+        if extra:
+            logger.warning(f"Extra features in prediction data (will be ignored): {extra}")
+        
+        # Reorder and select features
+        X = X[self.feature_names].copy()
+        
+        # Enforce dtypes
+        for col, dtype in self.feature_dtypes.items():
+            if col in self.categorical_features:
+                X[col] = X[col].astype('category')
+            else:
+                try:
+                    X[col] = X[col].astype(dtype)
+                except Exception as e:
+                    logger.warning(f"Could not convert {col} to {dtype}: {e}")
+        
+        return X
+    
+    def pso_objective(self, params, X, y, scale_pos_weight):
+        """PSO objective function with enhanced features"""
+        scores = []
+        
+        for param in params:
+            num_leaves = int(param[0])
+            learning_rate = max(param[1], 0.005)
+            n_estimators = int(param[2])
+            subsample = max(min(param[3], 1.0), 0.6)
+            colsample_bytree = max(min(param[4], 1.0), 0.6)
+            reg_alpha = max(param[5], 0)
+            reg_lambda = max(param[6], 0)
+            min_child_samples = int(param[7])
+            min_split_gain = max(param[8], 0)
+            max_depth = int(param[9])
+            
+            lgb_params = {
+                'objective': 'binary',
+                'metric': ['auc', 'binary_logloss'],
+                'boosting_type': 'gbdt',
+                'scale_pos_weight': scale_pos_weight,
+                'num_leaves': num_leaves,
+                'learning_rate': learning_rate,
+                'subsample': subsample,
+                'colsample_bytree': colsample_bytree,
+                'reg_alpha': reg_alpha,
+                'reg_lambda': reg_lambda,
+                'min_child_samples': min_child_samples,
+                'min_split_gain': min_split_gain,
+                'max_depth': max_depth,
+                'random_state': self.random_state,
+                'n_jobs': self.n_jobs,
+                'verbosity': -1,
+                'force_col_wise': True
+            }
+            
+            # 5-fold CV (better than 3-fold)
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.random_state)
+            cv_scores = []
+            
+            for train_idx, val_idx in cv.split(X, y):
+                X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+                
+                train_data = lgb.Dataset(
+                    X_train, label=y_train,
+                    categorical_feature=self.categorical_features,
+                    free_raw_data=False
+                )
+                val_data = lgb.Dataset(
+                    X_val, label=y_val,
+                    categorical_feature=self.categorical_features,
+                    reference=train_data,
+                    free_raw_data=False
+                )
+                
+                model = lgb.train(
+                    lgb_params,
+                    train_data,
+                    num_boost_round=n_estimators,
+                    valid_sets=[val_data],
+                    callbacks=[
+                        lgb.early_stopping(stopping_rounds=50, verbose=False),
+                        lgb.log_evaluation(period=0)
+                    ]
+                )
+                
+                # Use best_iteration for prediction
+                y_pred = model.predict(X_val, num_iteration=model.best_iteration)
+                score = roc_auc_score(y_val, y_pred)
+                cv_scores.append(score)
+            
+            mean_score = np.mean(cv_scores)
+            scores.append(1 - mean_score)  # PSO minimizes
+        
+        return np.array(scores)
+    
+    def optimize(self, X_train, y_train, n_particles=20, n_iterations=30):
+        """Run PSO optimization with history tracking"""
+        # Compute class weights
+        class_weights = compute_class_weight(
+            'balanced', 
+            classes=np.unique(y_train), 
+            y=y_train
+        )
+        scale_pos_weight = class_weights[1] / class_weights[0]
+        logger.info(f"Class distribution: {pd.Series(y_train).value_counts().to_dict()}")
+        logger.info(f"Computed scale_pos_weight: {scale_pos_weight:.4f}")
+        
+        # PSO bounds for 10 parameters (added min_split_gain, max_depth)
+        bounds = (
+            np.array([20, 0.01, 100, 0.6, 0.6, 0, 0, 5, 0, 3]),
+            np.array([200, 0.3, 1000, 1.0, 1.0, 10, 10, 100, 1.0, 12])
+        )
+        
+        logger.info("PSO Configuration:")
+        logger.info(f"  Particles: {n_particles}")
+        logger.info(f"  Dimensions: 10")
+        logger.info(f"  Iterations: {n_iterations}")
+        logger.info(f"  Parameters: num_leaves, learning_rate, n_estimators, subsample,")
+        logger.info(f"              colsample_bytree, reg_alpha, reg_lambda, min_child_samples, min_split_gain, max_depth")
+        
+        # Initialize PSO
+        optimizer = ps.single.GlobalBestPSO(
+            n_particles=n_particles,
+            dimensions=10,
+            options={'c1': 1.4, 'c2': 1.4, 'w': 0.7},
+            bounds=bounds
+        )
+        
+        logger.info("Running PSO optimization...")
+        
+        # Track cost history
+        cost_history = []
+        
+        def objective_with_tracking(p):
+            costs = self.pso_objective(p, X_train, y_train, scale_pos_weight)
+            cost_history.append(costs.min())
+            return costs
+        
+        best_cost, best_pos = optimizer.optimize(
+            objective_with_tracking,
+            iters=n_iterations
+        )
+        
+        # Save optimization history
+        self.pso_history = {
+            'best_cost_per_iteration': cost_history,
+            'final_best_cost': best_cost,
+            'final_best_auc': 1 - best_cost,
+            'best_position': best_pos.tolist()
+        }
+        
+        pso_history_path = os.path.join(SCRIPT_DIR, 'pso_results', f'pso_history_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        with open(pso_history_path, 'w') as f:
+            json.dump(self.pso_history, f, indent=2)
+        logger.info(f"PSO history saved to {pso_history_path}")
+        
+        # Plot PSO convergence
+        plt.figure(figsize=(10, 6))
+        plt.plot(1 - np.array(cost_history), marker='o')
+        plt.xlabel('Iteration')
+        plt.ylabel('Best AUC')
+        plt.title('PSO Convergence')
+        plt.grid(True)
+        pso_plot_path = os.path.join(SCRIPT_DIR, 'pso_results', f'pso_convergence_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(pso_plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"PSO convergence plot saved to {pso_plot_path}")
+        
+        logger.info("\n✓ PSO Optimization Complete")
+        logger.info(f"Best cost (1-AUC): {best_cost:.6f}")
+        logger.info(f"Best AUC: {1-best_cost:.6f}")
+        logger.info("\nOptimal Hyperparameters:")
+        logger.info(f"  num_leaves: {int(best_pos[0])}")
+        logger.info(f"  learning_rate: {best_pos[1]:.4f}")
+        logger.info(f"  n_estimators: {int(best_pos[2])}")
+        logger.info(f"  subsample: {best_pos[3]:.4f}")
+        logger.info(f"  colsample_bytree: {best_pos[4]:.4f}")
+        logger.info(f"  reg_alpha: {best_pos[5]:.4f}")
+        logger.info(f"  reg_lambda: {best_pos[6]:.4f}")
+        logger.info(f"  min_child_samples: {int(best_pos[7])}")
+        logger.info(f"  min_split_gain: {best_pos[8]:.4f}")
+        logger.info(f"  max_depth: {int(best_pos[9])}")
+        
+        # Build best parameters
+        self.best_params = {
+            'objective': 'binary',
+            'metric': ['auc', 'binary_logloss'],
+            'boosting_type': 'gbdt',
+            'scale_pos_weight': scale_pos_weight,
+            'num_leaves': int(best_pos[0]),
+            'learning_rate': best_pos[1],
+            'subsample': best_pos[3],
+            'colsample_bytree': best_pos[4],
+            'reg_alpha': best_pos[5],
+            'reg_lambda': best_pos[6],
+            'min_child_samples': int(best_pos[7]),
+            'min_split_gain': best_pos[8],
+            'max_depth': int(best_pos[9]),
+            'n_estimators': int(best_pos[2]),
+            'random_state': self.random_state,
+            'n_jobs': self.n_jobs,
+            'verbosity': -1,
+            'force_col_wise': True
+        }
+        
+        return self.best_params
+    
+    def train_final_model(self, X_train, y_train, X_val=None, y_val=None):
+        """Train final model with early stopping"""
+        if self.best_params is None:
+            raise ValueError("Run optimization first")
+        
+        logger.info("Training final model with best parameters...")
+        
+        train_data = lgb.Dataset(
+            X_train, label=y_train,
+            categorical_feature=self.categorical_features,
+            free_raw_data=False
+        )
+        
+        valid_sets = [train_data]
+        valid_names = ['train']
+        
+        if X_val is not None and y_val is not None:
+            val_data = lgb.Dataset(
+                X_val, label=y_val,
+                categorical_feature=self.categorical_features,
+                reference=train_data,
+                free_raw_data=False
+            )
+            valid_sets.append(val_data)
+            valid_names.append('valid')
+        
+        n_estimators = self.best_params.pop('n_estimators')
+        
+        self.best_model = lgb.train(
+            self.best_params,
+            train_data,
+            num_boost_round=n_estimators,
+            valid_sets=valid_sets,
+            valid_names=valid_names,
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=100, verbose=True),
+                lgb.log_evaluation(period=50)
+            ]
+        )
+        
+        logger.info(f"✓ Model training complete!")
+        logger.info(f"Best iteration: {self.best_model.best_iteration}")
+        logger.info(f"Training stopped at iteration: {self.best_model.current_iteration()}")
+        
+        return self.best_model
+    
+    def optimize_threshold(self, X_val, y_val, method='mcc'):
+        """Optimize classification threshold"""
+        if self.best_model is None:
+            raise ValueError("No model trained yet")
+        
+        y_pred_proba = self.best_model.predict(X_val, num_iteration=self.best_model.best_iteration)
+        
+        if method == 'f1':
+            thresholds = np.linspace(0.1, 0.9, 81)
+            f1_scores = []
+            for thresh in thresholds:
+                y_pred = (y_pred_proba >= thresh).astype(int)
+                f1 = f1_score(y_val, y_pred)
+                f1_scores.append(f1)
+            
+            best_idx = np.argmax(f1_scores)
+            self.best_threshold = thresholds[best_idx]
+            logger.info(f"Optimal threshold (F1): {self.best_threshold:.3f} (F1={f1_scores[best_idx]:.4f})")
+            
+        elif method == 'youden':
+            fpr, tpr, thresholds = roc_curve(y_val, y_pred_proba)
+            j_scores = tpr - fpr
+            best_idx = np.argmax(j_scores)
+            self.best_threshold = thresholds[best_idx]
+            logger.info(f"Optimal threshold (Youden): {self.best_threshold:.3f} (J={j_scores[best_idx]:.4f})")
+            
+        elif method == 'mcc':
+            thresholds = np.linspace(0.1, 0.9, 81)
+            mcc_scores = []
+            for thresh in thresholds:
+                y_pred = (y_pred_proba >= thresh).astype(int)
+                mcc = matthews_corrcoef(y_val, y_pred)
+                mcc_scores.append(mcc)
+            
+            best_idx = np.argmax(mcc_scores)
+            self.best_threshold = thresholds[best_idx]
+            logger.info(f"Optimal threshold (MCC): {self.best_threshold:.3f} (MCC={mcc_scores[best_idx]:.4f})")
+            logger.info(f"MCC optimized for imbalanced outbreak detection")
+        
+        return self.best_threshold
+    
+    def evaluate(self, X_test, y_test, save_predictions=True, test_id=None, test_date=None):
+        """Comprehensive model evaluation"""
+        if self.best_model is None:
+            raise ValueError("No model trained yet")
+        
+        y_pred_proba = self.best_model.predict(X_test, num_iteration=self.best_model.best_iteration)
+        y_pred_class = (y_pred_proba >= self.best_threshold).astype(int)
+        
+        metrics = {
+            'accuracy': accuracy_score(y_test, y_pred_class),
+            'auc': roc_auc_score(y_test, y_pred_proba),
+            'precision': precision_score(y_test, y_pred_class, zero_division=0),
+            'recall': recall_score(y_test, y_pred_class, zero_division=0),
+            'f1': f1_score(y_test, y_pred_class, zero_division=0),
+            'threshold': self.best_threshold,
+            'confusion_matrix': confusion_matrix(y_test, y_pred_class).tolist()
+        }
+        
+        logger.info(f"\n{'='*50}")
+        logger.info("EVALUATION METRICS")
+        logger.info(f"{'='*50}")
+        logger.info(f"AUC-ROC: {metrics['auc']:.4f}")
+        logger.info(f"Accuracy: {metrics['accuracy']:.4f}")
+        logger.info(f"Precision: {metrics['precision']:.4f}")
+        logger.info(f"Recall: {metrics['recall']:.4f}")
+        logger.info(f"F1-Score: {metrics['f1']:.4f}")
+        logger.info(f"Threshold: {metrics['threshold']:.3f}")
+        logger.info(f"\nConfusion Matrix:\n{confusion_matrix(y_test, y_pred_class)}")
+        logger.info(f"\n{classification_report(y_test, y_pred_class)}")
+        
+        if save_predictions:
+            pred_dict = {
+                'True_Label': y_test.values,
+                'Predicted_Probability': y_pred_proba,
+                'Predicted_Class': y_pred_class
+            }
+            
+            # Add ID and Date if provided
+            if test_id is not None:
+                pred_dict['ID'] = test_id.values if hasattr(test_id, 'values') else test_id
+            if test_date is not None:
+                pred_dict['Date'] = test_date.values if hasattr(test_date, 'values') else test_date
+            
+            pred_df = pd.DataFrame(pred_dict)
+            
+            pred_path = os.path.join(SCRIPT_DIR, 'predictions', f"validation_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            pred_df.to_csv(pred_path, index=False)
+            logger.info(f"Validation predictions saved to {pred_path}")
+        
+        # Save metrics as JSON
+        metrics_path = os.path.join(SCRIPT_DIR, 'models', f"metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(metrics_path, 'w') as f:
+            json.dump({k: v for k, v in metrics.items() if k != 'confusion_matrix'}, f, indent=2)
+        logger.info(f"Metrics saved to {metrics_path}")
+        
+        return metrics
+    
+    def save_feature_importance(self):
+        """Save feature importance (gain and split)"""
+        if self.best_model is None:
+            raise ValueError("No model trained yet")
+        
+        importance_gain = self.best_model.feature_importance(importance_type='gain')
+        importance_split = self.best_model.feature_importance(importance_type='split')
+        
+        importance_df = pd.DataFrame({
+            'feature': self.feature_names,
+            'importance_gain': importance_gain,
+            'importance_split': importance_split
+        }).sort_values('importance_gain', ascending=False)
+        
+        # Save to CSV
+        imp_path = os.path.join(SCRIPT_DIR, 'feature_importance', f"importance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        importance_df.to_csv(imp_path, index=False)
+        logger.info(f"Feature importance saved to {imp_path}")
+        
+        # Plot
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        top_n = min(20, len(importance_df))
+        
+        # Gain
+        axes[0].barh(range(top_n), importance_df['importance_gain'].head(top_n))
+        axes[0].set_yticks(range(top_n))
+        axes[0].set_yticklabels(importance_df['feature'].head(top_n))
+        axes[0].set_xlabel('Importance (Gain)')
+        axes[0].set_title('Top Features by Gain')
+        axes[0].invert_yaxis()
+        
+        # Split
+        axes[1].barh(range(top_n), importance_df['importance_split'].head(top_n))
+        axes[1].set_yticks(range(top_n))
+        axes[1].set_yticklabels(importance_df['feature'].head(top_n))
+        axes[1].set_xlabel('Importance (Split)')
+        axes[1].set_title('Top Features by Split')
+        axes[1].invert_yaxis()
+        
+        plt.tight_layout()
+        plot_path = os.path.join(SCRIPT_DIR, 'feature_importance', f"importance_plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Feature importance plot saved to {plot_path}")
+        
+        return importance_df
+    
+    def explain(self, X, sample_size=500, save_values=True):
+        """Generate SHAP explanations with saved values"""
+        if self.best_model is None:
+            raise ValueError("No model trained yet")
+        
+        if len(X) > sample_size:
+            X_sample = X.sample(sample_size, random_state=self.random_state)
+        else:
+            X_sample = X
+        
+        logger.info(f"Generating SHAP explanations using {len(X_sample)} samples")
+        
+        explainer = shap.TreeExplainer(self.best_model)
+        shap_values = explainer.shap_values(X_sample)
+        
+        # Handle binary classification
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1]  # Use positive class
+        
+        # Save SHAP values
+        if save_values:
+            shap_df = pd.DataFrame(shap_values, columns=self.feature_names)
+            shap_df['base_value'] = explainer.expected_value
+            shap_path = os.path.join(SCRIPT_DIR, 'shap_outputs', f"shap_values_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            shap_df.to_csv(shap_path, index=False)
+            logger.info(f"SHAP values saved to {shap_path}")
+        
+        # Summary plot
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values, X_sample, feature_names=self.feature_names, show=False)
+        summary_path = os.path.join(SCRIPT_DIR, 'shap_outputs', f"shap_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        plt.tight_layout()
+        plt.savefig(summary_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"SHAP summary plot saved to {summary_path}")
+        
+        # Bar plot
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values, X_sample, feature_names=self.feature_names, 
+                         plot_type="bar", show=False)
+        bar_path = os.path.join(SCRIPT_DIR, 'shap_outputs', f"shap_bar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        plt.tight_layout()
+        plt.savefig(bar_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"SHAP bar plot saved to {bar_path}")
+        
+        return shap_values
+    
+    def predict_new_data(self, file_path, output_path=None, id_col=None, 
+                        date_col=None, sheet_name=0):
+        """Predict on new data"""
+        if self.best_model is None:
+            raise ValueError("No trained model available")
+        
+        if output_path is None:
+            output_path = os.path.join(SCRIPT_DIR, 'predictions', f"new_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        
+        logger.info(f"Loading new data from {file_path}")
+        
+        X_new, _, ids, dates = self.load_data(
+            file_path=file_path,
+            target_col=None,
+            id_col=id_col,
+            date_col=date_col,
+            sheet_name=sheet_name
+        )
+        
+        # Validate and align features
+        X_new = self._validate_features(X_new, is_training=False)
+        
+        logger.info(f"Making predictions with threshold={self.best_threshold:.4f}...")
+        predictions = self.best_model.predict(X_new, num_iteration=self.best_model.best_iteration)
+        pred_labels = (predictions >= self.best_threshold).astype(int)
+        
+        # Create output
+        output_df = pd.DataFrame({
+            "Predicted_Probability": predictions,
+            "Predicted_Class": pred_labels
+        })
+        
+        if ids is not None:
+            output_df.insert(0, id_col, ids.values)
+        if dates is not None:
+            date_col_name = date_col if date_col else "Date"
+            output_df.insert(1 if ids is not None else 0, date_col_name, dates.values)
+        
+        output_df.to_csv(output_path, index=False)
+        logger.info(f"Predictions saved to {output_path}")
+        logger.info(f"Prediction distribution: {pd.Series(pred_labels).value_counts().to_dict()}")
+        
+        return output_df
+    
+    def save_model(self, model_path=None):
+        """Save complete model package"""
+        if self.best_model is None:
+            raise ValueError("No model to save")
+        
+        if model_path is None:
+            model_path = os.path.join(SCRIPT_DIR, 'models', f"lightgbm_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl")
+        
+        model_package = {
+            'model': self.best_model,
+            'params': self.best_params,
+            'threshold': self.best_threshold,
+            'feature_names': self.feature_names,
+            'categorical_features': self.categorical_features,
+            'feature_dtypes': self.feature_dtypes,
+            'random_state': self.random_state,
+            'pso_history': self.pso_history
+        }
+        
+        joblib.dump(model_package, model_path)
+        logger.info(f"Model package saved to {model_path}")
+        
+        # Save params as JSON
+        params_path = model_path.replace('.pkl', '_params.json')
+        with open(params_path, 'w') as f:
+            json.dump({
+                'params': {k: str(v) if not isinstance(v, (int, float, str, bool, type(None))) else v 
+                          for k, v in self.best_params.items()},
+                'threshold': self.best_threshold,
+                'feature_names': self.feature_names,
+                'categorical_features': self.categorical_features,
+                'best_iteration': int(self.best_model.best_iteration)
+            }, f, indent=2)
+        logger.info(f"Parameters saved to {params_path}")
+        
+        return model_path
+    
+    def load_model(self, model_path):
+        """Load complete model package"""
+        logger.info(f"Loading model from {model_path}")
+        
+        model_package = joblib.load(model_path)
+        
+        self.best_model = model_package['model']
+        self.best_params = model_package['params']
+        self.best_threshold = model_package['threshold']
+        self.feature_names = model_package['feature_names']
+        self.categorical_features = model_package['categorical_features']
+        self.feature_dtypes = model_package['feature_dtypes']
+        self.random_state = model_package.get('random_state', 42)
+        self.pso_history = model_package.get('pso_history', [])
+        
+        logger.info(f"✓ Model loaded successfully")
+        logger.info(f"Features: {len(self.feature_names)}, Threshold: {self.best_threshold:.3f}")
+        
+        return self.best_model
+
+
+def main():
+    try:
+        # Configuration
+        config = {
+            'training_file': os.path.join(SCRIPT_DIR, "Training.xlsx"),
+            'testing_file': os.path.join(SCRIPT_DIR, "Testing.xlsx"),
+            'target_col': "Target",
+            'id_col': "ID",
+            'date_col': "Date",
+            'categorical_cols': None,  # Auto-detect or specify: ['cat1', 'cat2']
+            'validation_size': 0.3,
+            'random_state': 42,
+            'pso_particles': 30,
+            'pso_iterations': 100,
+            'threshold_method': 'mcc',  # 'mcc' (recommended for imbalanced), 'f1', or 'youden'
+            'shap_sample_size': 500
+        }
+        
+        logger.info("="*70)
+        logger.info("IMPROVED LIGHTGBM TRAINING PIPELINE WITH PSO")
+        logger.info("="*70)
+        logger.info(f"Configuration: {json.dumps(config, indent=2)}")
+        
+        # Set random seed
+        np.random.seed(config['random_state'])
+        
+        # Initialize
+        optimizer = LightGBMOptimizer(random_state=config['random_state'])
+        
+        # 1. Load data
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 1: LOADING TRAINING DATA")
+        logger.info(f"{'='*70}")
+        
+        X, y, ids, dates = optimizer.load_data(
+            file_path=config['training_file'],
+            target_col=config['target_col'],
+            id_col=config['id_col'],
+            date_col=config['date_col'],
+            categorical_cols=config['categorical_cols']
+        )
+        
+        # 2. Split data
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 2: SPLITTING DATA")
+        logger.info(f"{'='*70}")
+        
+        X_train, X_val, y_train, y_val, train_ids, val_ids, train_dates, val_dates = train_test_split(
+            X, y, ids, dates,
+            test_size=config['validation_size'],
+            stratify=y,
+            random_state=config['random_state']
+        )
+        
+        logger.info(f"Training set: {len(X_train)} samples")
+        logger.info(f"Validation set: {len(X_val)} samples")
+        logger.info(f"Training target: {pd.Series(y_train).value_counts().to_dict()}")
+        logger.info(f"Validation target: {pd.Series(y_val).value_counts().to_dict()}")
+        
+        # 3. PSO optimization
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 3: PSO OPTIMIZATION")
+        logger.info(f"{'='*70}")
+        
+        best_params = optimizer.optimize(
+            X_train, y_train,
+            n_particles=config['pso_particles'],
+            n_iterations=config['pso_iterations']
+        )
+        
+        # 4. Train final model
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 4: TRAINING FINAL MODEL")
+        logger.info(f"{'='*70}")
+        
+        model = optimizer.train_final_model(X_train, y_train, X_val, y_val)
+        
+        # 5. Threshold calibration
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 5: THRESHOLD CALIBRATION")
+        logger.info(f"{'='*70}")
+        
+        threshold = optimizer.optimize_threshold(X_val, y_val, method=config['threshold_method'])
+        
+        # 6. Evaluation
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 6: EVALUATION")
+        logger.info(f"{'='*70}")
+        
+        metrics = optimizer.evaluate(X_val, y_val, test_id=val_ids, test_date=val_dates)
+        
+        # 7. Feature importance
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 7: FEATURE IMPORTANCE")
+        logger.info(f"{'='*70}")
+        
+        importance_df = optimizer.save_feature_importance()
+        logger.info(f"\nTop 10 features:\n{importance_df.head(10)}")
+        
+        # 8. SHAP
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 8: SHAP EXPLANATIONS")
+        logger.info(f"{'='*70}")
+        
+        shap_values = optimizer.explain(X_train, sample_size=config['shap_sample_size'])
+        
+        # 9. Save model
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 9: SAVING MODEL")
+        logger.info(f"{'='*70}")
+        
+        model_path = optimizer.save_model()
+        
+        # 10. Predict on test data
+        logger.info(f"\n{'='*70}")
+        logger.info("STEP 10: PREDICTIONS ON NEW DATA")
+        logger.info(f"{'='*70}")
+        
+        if os.path.exists(config['testing_file']):
+            test_predictions = optimizer.predict_new_data(
+                file_path=config['testing_file'],
+                id_col=config['id_col'],
+                date_col=config['date_col']
+            )
+            logger.info(f"\nFirst 5 predictions:\n{test_predictions.head()}")
+        else:
+            logger.warning(f"Test file {config['testing_file']} not found")
+        
+        # Summary
+        logger.info(f"\n{'='*70}")
+        logger.info("✓ PIPELINE COMPLETED SUCCESSFULLY")
+        logger.info(f"{'='*70}")
+        logger.info(f"Model: {os.path.abspath(model_path)}")
+        logger.info(f"AUC-ROC: {metrics['auc']:.4f}")
+        logger.info(f"F1-Score: {metrics['f1']:.4f}")
+        logger.info(f"Optimal Threshold: {threshold:.3f}")
+        logger.info(f"Best Iteration: {model.best_iteration}")
+        logger.info(f"All outputs in: {SCRIPT_DIR}")
+        
+        print(f"\n{'='*70}")
+        print("✓ Pipeline completed successfully!")
+        print(f"{'='*70}")
+        print(f"Model saved: {model_path}")
+        print(f"Validation AUC: {metrics['auc']:.4f}")
+        print(f"Validation F1: {metrics['f1']:.4f}")
+        print(f"Log file: {log_filename}")
+        
+    except Exception as e:
+        logger.error(f"Error in main execution: {str(e)}", exc_info=True)
+        print(f"\n✗ Error occurred: {str(e)}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
