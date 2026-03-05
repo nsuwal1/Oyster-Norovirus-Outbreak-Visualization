@@ -922,8 +922,8 @@ elif page == "Results":
             margin=dict(l=0, r=0, t=40, b=0)
         )
 
-        # Adjust figure height based on full-screen mode
-        fig4.update_layout(height=700)
+        # Adjust figure height
+        fig4.update_layout(height=550)
         st.plotly_chart(
             fig4,
             use_container_width=True,
