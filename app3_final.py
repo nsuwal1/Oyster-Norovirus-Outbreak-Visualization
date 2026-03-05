@@ -224,27 +224,27 @@ if page == "About Data":
         ## Derived Input Features
         
         ### Solar Radiation
-        - **SR1**: Total mean solar radiation from 4–29 days prior to outbreak
+        - **SR1**: Total mean solar radiation from 5–29 days prior to outbreak
         - **SR2**: Mean solar radiation from 14–30 days prior to outbreak
         
         ### Temperature
         - **T1**: Mean maximum temperature from 14–30 days prior to outbreak
         - **T2**: Mean average temperature from 14–21 days prior to outbreak
-        - **T3**: Temperature fluctuation 2 days prior to outbreak
+        - **T3**: Temperature fluctuation 5 days prior to outbreak
         - **T4**: Average water temperature 30 days prior to outbreak
         
         ### Gage Height
-        - **GH1**: Total mean gage height from 4–30 days prior to outbreak
-        - **GH2**: Average gage height 2 days prior to outbreak
+        - **GH1**: Total mean gage height from 5–30 days prior to outbreak
+        - **GH2**: Average gage height 5 days prior to outbreak
         - **GH3**: Gage height variation 17 days prior to outbreak
         - **GH4**: Minimum gage height difference between 11 and 12 days prior to outbreak
         
         ### Rainfall
-        - **R1**: Total rainfall from 4–9 days prior to outbreak
-        - **R2**: Cumulative rainfall in 10 days prior to outbreak
+        - **R1**: Total rainfall from 5–9 days prior to outbreak
+        - **R2**: Total rainfall from 5–10 days prior to outbreak
         
         ### Salinity
-        - **S1**: Total daily average salinity from 4–29 days prior to outbreak
+        - **S1**: Total daily average salinity from 5–29 days prior to outbreak
         - **S2**: Daily average salinity 30 days prior to outbreak
         
         ### Location
